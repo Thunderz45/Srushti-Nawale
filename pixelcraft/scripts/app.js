@@ -1,15 +1,32 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
-import { getAnalytics } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-analytics.js";
+import { getAnalytics, isSupported } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-analytics.js";
 import { 
     getAuth, 
     signInWithEmailAndPassword, 
     createUserWithEmailAndPassword, 
     signOut, 
     onAuthStateChanged,
-    updateProfile,
-    GoogleAuthProvider,
-    signInWithPopup
+    updateProfile
 } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js";
+import { 
+    getFirestore, 
+    doc, 
+    getDoc, 
+    setDoc, 
+    collection, 
+    getDocs, 
+    deleteDoc, 
+    query, 
+    orderBy,
+    runTransaction,
+    onSnapshot
+} from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
+import { 
+    getStorage, 
+    ref as storageRef, 
+    uploadBytes, 
+    getDownloadURL 
+} from "https://www.gstatic.com/firebasejs/10.8.0/firebase-storage.js";
 
 // Your web app's Firebase configuration
 const firebaseConfig = {
@@ -24,8 +41,37 @@ const firebaseConfig = {
 
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
-const analytics = getAnalytics(app);
 const auth = getAuth(app);
+
+// Initialize Firebase Services with Safe Fallbacks
+let db = null;
+let storage = null;
+try {
+    db = getFirestore(app);
+    storage = getStorage(app);
+    console.log("PixelAI: Firestore and Storage services initialized successfully.");
+} catch (error) {
+    console.warn("PixelAI: Firestore or Storage failed to initialize:", error);
+}
+
+// Safe Analytics initialization that won't halt script execution if blocked (e.g. on mobile private browsing)
+let analytics = null;
+try {
+    isSupported()
+        .then((supported) => {
+            if (supported) {
+                analytics = getAnalytics(app);
+                console.log("PixelAI: Firebase Analytics initialized successfully.");
+            } else {
+                console.log("PixelAI: Firebase Analytics is not supported in this environment.");
+            }
+        })
+        .catch((error) => {
+            console.warn("PixelAI: Firebase Analytics support check failed:", error);
+        });
+} catch (error) {
+    console.warn("PixelAI: Firebase Analytics initialization failed:", error);
+}
 
 /**
  * PixelAI Studio - AI Image Generator Core Logic
@@ -78,7 +124,7 @@ const state = {
     currentUser: null,
     
     // Credits & Subscription States
-    credits: 0,
+    credits: 5,
     subscriptionStatus: "free" // "free" or "pro"
 };
 
@@ -112,10 +158,29 @@ const el = {
     // View navigation elements
     get linkHome() { return document.getElementById("link-home"); },
     get linkStudio() { return document.getElementById("link-studio"); },
+    get linkProfile() { return document.getElementById("link-profile"); },
     get viewHome() { return document.getElementById("view-home"); },
     get viewStudio() { return document.getElementById("view-studio"); },
+    get viewProfile() { return document.getElementById("view-profile"); },
     get navBrand() { return document.getElementById("nav-brand"); },
     get heroGetStarted() { return document.getElementById("hero-get-started-btn"); },
+    
+    // Hamburger Menu & Backdrops
+    get btnMenuToggle() { return document.getElementById("btn-menu-toggle"); },
+    get btnMenuClose() { return document.getElementById("btn-menu-close"); },
+    get navLinksMenu() { return document.getElementById("nav-links-menu"); },
+    get drawerBackdrop() { return document.getElementById("drawer-backdrop"); },
+    
+    // Profile DOM Elements
+    get profileDisplayName() { return document.getElementById("profile-display-name"); },
+    get profileDisplayEmail() { return document.getElementById("profile-display-email"); },
+    get profileDisplayBadge() { return document.getElementById("profile-display-badge"); },
+    get btnThemeLight() { return document.getElementById("btn-theme-light"); },
+    get btnThemeDark() { return document.getElementById("btn-theme-dark"); },
+    get formUpdateProfile() { return document.getElementById("form-update-profile"); },
+    get updateName() { return document.getElementById("update-name"); },
+    get btnClearHistory() { return document.getElementById("btn-clear-history"); },
+    get historyGrid() { return document.getElementById("history-grid"); },
     
     // Showcase cards
     get cardVector() { return document.getElementById("card-trigger-vector"); },
@@ -165,7 +230,11 @@ const el = {
     get btnSubscribePro() { return document.getElementById("btn-subscribe-pro"); },
     get btnCancelPro() { return document.getElementById("btn-cancel-pro"); },
     get planCardFree() { return document.getElementById("plan-card-free"); },
-    get planCardPro() { return document.getElementById("plan-card-pro"); }
+    get planCardPro() { return document.getElementById("plan-card-pro"); },
+    
+    // Welcome Credits Modal Elements
+    get welcomeCreditsModal() { return document.getElementById("welcome-credits-modal"); },
+    get welcomeCreditsCloseBtn() { return document.getElementById("welcome-credits-close-btn"); }
 };
 
 // Category style prompt modifier mappings
@@ -177,6 +246,262 @@ const CATEGORY_PROMPTS = {
     "3d-render": ", cute 3d render, octane render, stylized art style, claymation, soft lighting",
     "anime": ", vibrant anime style, clean lines, colorful visual shading, key visual"
 };
+
+// ==========================================================================
+// INDEXEDDB DATABASE FOR USER CREATION HISTORY
+// ==========================================================================
+const DB_NAME = "PixelAIHistoryDB";
+const STORE_NAME = "history";
+let dbConnection = null;
+let unsubscribeCredits = null;
+
+function initHistoryDB() {
+    return new Promise((resolve) => {
+        try {
+            const request = indexedDB.open(DB_NAME, 1);
+            request.onupgradeneeded = (e) => {
+                const database = e.target.result;
+                if (!database.objectStoreNames.contains(STORE_NAME)) {
+                    database.createObjectStore(STORE_NAME, { keyPath: "id" });
+                }
+            };
+            request.onsuccess = (e) => {
+                dbConnection = e.target.result;
+                resolve(dbConnection);
+            };
+            request.onerror = (e) => {
+                console.warn("IndexedDB failed to open:", e);
+                resolve(null);
+            };
+        } catch (error) {
+            console.warn("IndexedDB is not supported or blocked in this environment:", error);
+            resolve(null);
+        }
+    });
+}
+
+async function saveGenerationToFirestore(uid, itemId, prompt, category, seed, blob) {
+    if (!db || !storage) return null;
+    try {
+        // 1. Upload the image blob to Firebase Storage
+        const imageRef = storageRef(storage, `users/${uid}/generations/${itemId}.jpg`);
+        const snapshot = await uploadBytes(imageRef, blob);
+        const downloadURL = await getDownloadURL(snapshot.ref);
+        
+        // 2. Save metadata to Firestore
+        const historyDocRef = doc(db, "users", uid, "history", itemId);
+        const item = {
+            id: itemId,
+            uid: uid,
+            prompt: prompt,
+            category: category,
+            seed: seed,
+            imageUrl: downloadURL,
+            timestamp: Date.now()
+        };
+        await setDoc(historyDocRef, item);
+        console.log("Successfully saved generation to Firestore and Storage.");
+        return downloadURL;
+    } catch (err) {
+        console.warn("Firestore/Storage history save failed:", err);
+        return null;
+    }
+}
+
+function saveServerItemToLocalIndexedDB(item) {
+    return new Promise((resolve) => {
+        if (!dbConnection) return resolve(false);
+        try {
+            const transaction = dbConnection.transaction([STORE_NAME], "readwrite");
+            const store = transaction.objectStore(STORE_NAME);
+            const localItem = {
+                id: item.id,
+                uid: item.uid,
+                prompt: item.prompt,
+                category: item.category,
+                seed: item.seed,
+                imageData: item.imageUrl, // Store Firestore URL directly as imageData
+                timestamp: item.timestamp
+            };
+            store.put(localItem);
+            resolve(true);
+        } catch (e) {
+            console.warn("Failed to write server item to IndexedDB:", e);
+            resolve(false);
+        }
+    });
+}
+
+function saveGenerationToHistory(uid, prompt, category, seed, blob) {
+    const itemId = `${uid}_${Date.now()}`;
+    
+    // Save to local IndexedDB first
+    if (dbConnection) {
+        const reader = new FileReader();
+        reader.readAsDataURL(blob);
+        reader.onloadend = () => {
+            try {
+                const base64Data = reader.result;
+                const transaction = dbConnection.transaction([STORE_NAME], "readwrite");
+                const store = transaction.objectStore(STORE_NAME);
+                const item = {
+                    id: itemId,
+                    uid: uid,
+                    prompt: prompt,
+                    category: category,
+                    seed: seed,
+                    imageData: base64Data,
+                    timestamp: Date.now()
+                };
+                store.put(item);
+                console.log("Successfully saved generation to IndexedDB history.");
+            } catch (e) {
+                console.warn("Failed to write to IndexedDB:", e);
+            }
+        };
+    }
+    
+    // Also save to Firestore & Storage asynchronously
+    saveGenerationToFirestore(uid, itemId, prompt, category, seed, blob);
+}
+
+async function getGenerationHistory(uid) {
+    // 1. Get current local history from IndexedDB
+    let localHistory = [];
+    if (dbConnection) {
+        try {
+            localHistory = await new Promise((resolve) => {
+                const transaction = dbConnection.transaction([STORE_NAME], "readonly");
+                const store = transaction.objectStore(STORE_NAME);
+                const request = store.getAll();
+                request.onsuccess = () => {
+                    const all = request.result || [];
+                    const filtered = all
+                        .filter(item => item.uid === uid)
+                        .sort((a, b) => b.timestamp - a.timestamp);
+                    resolve(filtered);
+                };
+                request.onerror = () => resolve([]);
+            });
+        } catch (err) {
+            console.warn("Local IndexedDB read failed:", err);
+        }
+    }
+    
+    // 2. Fetch history from Firestore and sync
+    if (db) {
+        try {
+            const historyCollRef = collection(db, "users", uid, "history");
+            const q = query(historyCollRef, orderBy("timestamp", "desc"));
+            const querySnapshot = await getDocs(q);
+            
+            const serverHistory = [];
+            querySnapshot.forEach((doc) => {
+                serverHistory.push(doc.data());
+            });
+            
+            // Sync server items with local IndexedDB if they are missing
+            for (const item of serverHistory) {
+                const exists = localHistory.some(localItem => localItem.id === item.id);
+                if (!exists) {
+                    await saveServerItemToLocalIndexedDB(item);
+                    localHistory.push({
+                        id: item.id,
+                        uid: item.uid,
+                        prompt: item.prompt,
+                        category: item.category,
+                        seed: item.seed,
+                        imageData: item.imageUrl, // use imageUrl for display
+                        timestamp: item.timestamp
+                    });
+                }
+            }
+            
+            // Sort by timestamp descending
+            localHistory.sort((a, b) => b.timestamp - a.timestamp);
+        } catch (err) {
+            console.warn("Failed to fetch history from Firestore:", err);
+        }
+    }
+    
+    return localHistory;
+}
+
+async function clearGenerationHistory(uid) {
+    // 1. Clear local history from IndexedDB
+    if (dbConnection) {
+        try {
+            await new Promise((resolve) => {
+                const transaction = dbConnection.transaction([STORE_NAME], "readwrite");
+                const store = transaction.objectStore(STORE_NAME);
+                const request = store.getAll();
+                request.onsuccess = () => {
+                    const all = request.result || [];
+                    const userItems = all.filter(item => item.uid === uid);
+                    userItems.forEach(item => {
+                        store.delete(item.id);
+                    });
+                    resolve(true);
+                };
+                request.onerror = () => resolve(false);
+            });
+        } catch (err) {
+            console.warn("Local IndexedDB clear failed:", err);
+        }
+    }
+    
+    // 2. Clear history from Firestore
+    if (db) {
+        try {
+            const historyCollRef = collection(db, "users", uid, "history");
+            const querySnapshot = await getDocs(historyCollRef);
+            const batchDeletes = [];
+            querySnapshot.forEach((doc) => {
+                batchDeletes.push(deleteDoc(doc.ref));
+            });
+            await Promise.all(batchDeletes);
+        } catch (err) {
+            console.warn("Failed to clear Firestore history:", err);
+        }
+    }
+    
+    return true;
+}
+
+// ==========================================================================
+// APPEARANCE & THEME SWITCHER
+// ==========================================================================
+function initTheme() {
+    const savedTheme = localStorage.getItem("pixelai_theme") || "light";
+    setTheme(savedTheme);
+}
+
+function setTheme(theme) {
+    if (theme === "dark") {
+        document.body.classList.add("dark-theme");
+        if (el.btnThemeDark) el.btnThemeDark.classList.add("active");
+        if (el.btnThemeLight) el.btnThemeLight.classList.remove("active");
+        localStorage.setItem("pixelai_theme", "dark");
+    } else {
+        document.body.classList.remove("dark-theme");
+        if (el.btnThemeLight) el.btnThemeLight.classList.add("active");
+        if (el.btnThemeDark) el.btnThemeDark.classList.remove("active");
+        localStorage.setItem("pixelai_theme", "light");
+    }
+}
+
+// ==========================================================================
+// MOBILE DRAWER sidebar CONTROL
+// ==========================================================================
+function toggleMobileMenu(isOpen) {
+    if (isOpen) {
+        el.navLinksMenu.classList.add("open");
+        el.drawerBackdrop.classList.remove("hide");
+    } else {
+        el.navLinksMenu.classList.remove("open");
+        el.drawerBackdrop.classList.add("hide");
+    }
+}
 
 // Helper to safely bind event listeners to DOM elements (preventing script crashes)
 function safeBind(element, event, handler) {
@@ -195,32 +520,42 @@ function safeBind(element, event, handler) {
 function init() {
     console.log("PixelAI: Initializing core application event listeners...");
     
+    // Initialize user themes and databases
+    initTheme();
+    initHistoryDB();
+    
     // Setup Firebase Auth State Listener
-    onAuthStateChanged(auth, (user) => {
+    onAuthStateChanged(auth, async (user) => {
         if (user) {
             state.isLoggedIn = true;
             state.currentUser = user.displayName || user.email;
             
-            // Initialize credits for new user
-            const creditKey = `pixelai_credits_${user.uid}`;
-            let userCredits = localStorage.getItem(creditKey);
-            if (userCredits === null) {
-                userCredits = "5";
-                localStorage.setItem(creditKey, userCredits);
-            }
-            state.credits = parseInt(userCredits, 10);
-            
-            // Initialize subscription status
-            const subKey = `pixelai_subscription_${user.uid}`;
-            state.subscriptionStatus = localStorage.getItem(subKey) || "free";
+            // Show profile navigation link
+            if (el.linkProfile) el.linkProfile.classList.remove("hide");
             
             updateNavForUser(state.currentUser);
+            
+            // Initialize credits to 5 immediately to prevent 0 credits race conditions before sync
+            state.credits = 5;
             updateCreditsUI();
+            
+            // Sync user data (credits & subscription) with Firestore
+            await syncUserDataWithFirestore(user);
         } else {
+            // Unsubscribe from real-time credits updates on logout
+            if (unsubscribeCredits) {
+                unsubscribeCredits();
+                unsubscribeCredits = null;
+            }
+            
             state.isLoggedIn = false;
             state.currentUser = null;
             state.credits = 0;
             state.subscriptionStatus = "free";
+            
+            // Hide profile navigation link
+            if (el.linkProfile) el.linkProfile.classList.add("hide");
+            
             el.btnAuthNav.textContent = "Sign In";
             el.btnAuthNav.className = "btn-auth-outline";
             updateCreditsUI();
@@ -249,8 +584,14 @@ function init() {
     // Navigation triggers
     safeBind(el.linkHome, "click", (e) => { e.preventDefault(); switchView("home"); });
     safeBind(el.linkStudio, "click", (e) => { e.preventDefault(); switchView("studio"); });
+    safeBind(el.linkProfile, "click", (e) => { e.preventDefault(); switchView("profile"); });
     safeBind(el.navBrand, "click", () => switchView("home"));
     safeBind(el.heroGetStarted, "click", () => switchView("studio"));
+
+    // Hamburger Mobile Menu triggers
+    safeBind(el.btnMenuToggle, "click", () => toggleMobileMenu(true));
+    safeBind(el.btnMenuClose, "click", () => toggleMobileMenu(false));
+    safeBind(el.drawerBackdrop, "click", () => toggleMobileMenu(false));
 
     // Showcase card navigation triggers
     setupShowcaseTrigger(el.cardVector, "vector");
@@ -276,13 +617,7 @@ function init() {
     safeBind(el.formLogin, "submit", handleLoginSubmit);
     safeBind(el.formSignup, "submit", handleSignupSubmit);
     
-    // Bind Google Auth buttons
-    const googleBtns = document.querySelectorAll(".btn-google-submit");
-    if (googleBtns && googleBtns.length > 0) {
-        googleBtns.forEach(btn => {
-            safeBind(btn, "click", handleGoogleAuth);
-        });
-    }
+
     
     // Close modal on backdrop click
     safeBind(el.authModal, "click", (e) => {
@@ -304,28 +639,53 @@ function init() {
     safeBind(el.subscriptionModal, "click", (e) => {
         if (e.target === el.subscriptionModal) closeSubscriptionModal();
     });
+
+    // Welcome Credits Modal listeners
+    safeBind(el.welcomeCreditsCloseBtn, "click", closeWelcomeCreditsPopup);
+    safeBind(el.welcomeCreditsModal, "click", (e) => {
+        if (e.target === el.welcomeCreditsModal) closeWelcomeCreditsPopup();
+    });
+
+    // Theme Switches
+    safeBind(el.btnThemeLight, "click", () => setTheme("light"));
+    safeBind(el.btnThemeDark, "click", () => setTheme("dark"));
+
+    // Profile Settings Update
+    safeBind(el.formUpdateProfile, "submit", handleUpdateProfile);
+    safeBind(el.btnClearHistory, "click", handleClearHistory);
     
     console.log("PixelAI: Event listeners configured successfully.");
 }
 
 // Navigation Helper with Login Guards
 function switchView(viewName) {
-    if (viewName === "studio" && !state.isLoggedIn) {
+    if ((viewName === "studio" || viewName === "profile") && !state.isLoggedIn) {
         openAuthModal("login");
-        showToast("Authentication required to access Studio.", "info");
+        showToast("Authentication required to access this section.", "info");
         return;
     }
 
+    // Close mobile menu when switching views
+    toggleMobileMenu(false);
+
+    el.viewHome.classList.add("hide");
+    el.viewStudio.classList.add("hide");
+    el.viewProfile.classList.add("hide");
+    
+    el.linkHome.classList.remove("active");
+    el.linkStudio.classList.remove("active");
+    el.linkProfile.classList.remove("active");
+
     if (viewName === "home") {
         el.viewHome.classList.remove("hide");
-        el.viewStudio.classList.add("hide");
         el.linkHome.classList.add("active");
-        el.linkStudio.classList.remove("active");
     } else if (viewName === "studio") {
-        el.viewHome.classList.add("hide");
         el.viewStudio.classList.remove("hide");
-        el.linkHome.classList.remove("active");
         el.linkStudio.classList.add("active");
+    } else if (viewName === "profile") {
+        el.viewProfile.classList.remove("hide");
+        el.linkProfile.classList.add("active");
+        renderProfilePage();
     }
     window.scrollTo({ top: 0, behavior: "smooth" });
 }
@@ -397,6 +757,139 @@ function updateNavForUser(username) {
     const cleanName = username.split(" ")[0];
     el.btnAuthNav.textContent = `Sign Out (${cleanName})`;
     el.btnAuthNav.className = "btn-auth-outline active-session";
+}
+
+// Sync user data (credits & subscription) with Firestore via real-time listener
+function syncUserDataWithFirestore(user) {
+    if (!db) {
+        state.credits = 5;
+        state.subscriptionStatus = "free";
+        updateCreditsUI();
+        return;
+    }
+    
+    const userDocRef = doc(db, "users", user.uid);
+    
+    // Clean up any existing listener first
+    if (unsubscribeCredits) {
+        unsubscribeCredits();
+        unsubscribeCredits = null;
+    }
+    
+    unsubscribeCredits = onSnapshot(userDocRef, async (docSnap) => {
+        let isNewUser = false;
+        if (docSnap.exists()) {
+            const data = docSnap.data();
+            state.credits = data.credits !== undefined ? data.credits : 5;
+            state.subscriptionStatus = data.subscriptionStatus || "free";
+            updateCreditsUI();
+        } else {
+            // First time logging in or missing server doc, create it with 5 credits
+            isNewUser = true;
+            try {
+                // Immediately set state.credits to 5 and update UI to avoid race condition/delay
+                state.credits = 5;
+                state.subscriptionStatus = "free";
+                updateCreditsUI();
+                
+                await setDoc(userDocRef, {
+                    uid: user.uid,
+                    email: user.email,
+                    displayName: user.displayName || "",
+                    credits: 5,
+                    subscriptionStatus: "free",
+                    createdAt: Date.now(),
+                    updatedAt: Date.now()
+                });
+            } catch (err) {
+                console.warn("Failed to create user document in Firestore:", err);
+            }
+        }
+        
+        // Trigger welcome credits popup if this is a new user
+        const welcomeShownKey = `pixelai_welcome_shown_${user.uid}`;
+        if (isNewUser && !localStorage.getItem(welcomeShownKey)) {
+            localStorage.setItem(welcomeShownKey, "true");
+            showWelcomeCreditsPopup();
+        }
+    }, (err) => {
+        console.warn("Real-time credits sync listener failed:", err);
+    });
+}
+
+// Centered credit deduction using Firestore Transactions
+async function deductCreditTransaction(uid, actionName) {
+    if (!db) throw new Error("Firestore is not initialized.");
+    
+    const userDocRef = doc(db, "users", uid);
+    const transactionCollRef = collection(db, "credit_transactions");
+    const newTxDocRef = doc(transactionCollRef); // Auto-ID document reference
+    
+    await runTransaction(db, async (transaction) => {
+        const userDoc = await transaction.get(userDocRef);
+        if (!userDoc.exists()) {
+            throw new Error("User profile not found in database.");
+        }
+        
+        const currentCredits = userDoc.data().credits !== undefined ? userDoc.data().credits : 5;
+        if (currentCredits < 1) {
+            throw new Error("Insufficient credits.");
+        }
+        
+        // 1. Decrement user's credits
+        transaction.update(userDocRef, {
+            credits: currentCredits - 1,
+            updatedAt: Date.now()
+        });
+        
+        // 2. Write new log to credit_transactions
+        transaction.set(newTxDocRef, {
+            userId: uid,
+            action: actionName,
+            creditsUsed: 1,
+            timestamp: Date.now()
+        });
+    });
+}
+
+// Centered credit refund using Firestore Transactions (in case generation fails)
+async function refundCreditTransaction(uid, actionName) {
+    if (!db) return;
+    try {
+        const userDocRef = doc(db, "users", uid);
+        const transactionCollRef = collection(db, "credit_transactions");
+        const newTxDocRef = doc(transactionCollRef);
+        
+        await runTransaction(db, async (transaction) => {
+            const userDoc = await transaction.get(userDocRef);
+            if (userDoc.exists()) {
+                const currentCredits = userDoc.data().credits !== undefined ? userDoc.data().credits : 5;
+                transaction.update(userDocRef, {
+                    credits: currentCredits + 1,
+                    updatedAt: Date.now()
+                });
+                transaction.set(newTxDocRef, {
+                    userId: uid,
+                    action: actionName,
+                    creditsUsed: -1, // negative implies refund / credit increment
+                    timestamp: Date.now()
+                });
+            }
+        });
+        console.log("Credit transaction successfully refunded.");
+    } catch (err) {
+        console.warn("Failed to refund credit transaction:", err);
+    }
+}
+
+async function updateUserSubscriptionInFirestore(uid, subscriptionStatus) {
+    if (!db) return;
+    try {
+        const userDocRef = doc(db, "users", uid);
+        await setDoc(userDocRef, { subscriptionStatus, updatedAt: Date.now() }, { merge: true });
+    } catch (err) {
+        console.warn("Failed to update subscription in Firestore:", err);
+    }
 }
 
 // ==========================================================================
@@ -496,6 +989,38 @@ function closeSubscriptionModal() {
     el.subscriptionModal.classList.add("hide");
 }
 
+let welcomeCreditsTimeout = null;
+
+function showWelcomeCreditsPopup() {
+    if (el.welcomeCreditsModal) {
+        el.welcomeCreditsModal.classList.remove("hide");
+        
+        // Reset the progress bar animation
+        const progressEl = document.getElementById("welcome-credits-progress");
+        if (progressEl) {
+            progressEl.style.animation = 'none';
+            progressEl.offsetHeight; // trigger reflow
+            progressEl.style.animation = 'shrinkProgress 5s linear forwards';
+        }
+        
+        if (welcomeCreditsTimeout) clearTimeout(welcomeCreditsTimeout);
+        
+        welcomeCreditsTimeout = setTimeout(() => {
+            closeWelcomeCreditsPopup();
+        }, 5000);
+    }
+}
+
+function closeWelcomeCreditsPopup() {
+    if (el.welcomeCreditsModal) {
+        el.welcomeCreditsModal.classList.add("hide");
+    }
+    if (welcomeCreditsTimeout) {
+        clearTimeout(welcomeCreditsTimeout);
+        welcomeCreditsTimeout = null;
+    }
+}
+
 function startRazorpayCheckout() {
     if (!state.isLoggedIn || !auth.currentUser) {
         openAuthModal("login");
@@ -543,6 +1068,8 @@ function handleRazorpaySuccess(paymentId) {
     updateCreditsUI();
     closeSubscriptionModal();
     showToast(`Payment successful! ID: ${paymentId}. Welcome to Pro Creator.`, "success");
+    
+    updateUserSubscriptionInFirestore(auth.currentUser.uid, "pro");
 }
 
 function handleCancelSubscription() {
@@ -555,6 +1082,147 @@ function handleCancelSubscription() {
         updateCreditsUI();
         closeSubscriptionModal();
         showToast("Pro subscription cancelled successfully.", "info");
+        
+        updateUserSubscriptionInFirestore(auth.currentUser.uid, "free");
+    }
+}
+
+// ==========================================================================
+// USER PROFILE SETTINGS & HISTORIES RENDERERS
+// ==========================================================================
+
+function renderProfilePage() {
+    if (!auth.currentUser) return;
+    
+    const user = auth.currentUser;
+    el.profileDisplayName.textContent = user.displayName || "Studio Creator";
+    el.profileDisplayEmail.textContent = user.email;
+    el.updateName.value = user.displayName || "";
+
+    const isPro = state.subscriptionStatus === "pro";
+    if (isPro) {
+        el.profileDisplayBadge.className = "plan-badge-pro";
+        el.profileDisplayBadge.textContent = "Pro Plan";
+    } else {
+        el.profileDisplayBadge.className = "plan-badge-free";
+        el.profileDisplayBadge.textContent = "Free Plan";
+    }
+
+    // Fetch and render generation history
+    getGenerationHistory(user.uid).then(historyItems => {
+        el.historyGrid.innerHTML = "";
+        
+        if (historyItems.length === 0) {
+            el.historyGrid.innerHTML = `
+                <div class="history-empty-state">
+                    <i class="ri-image-line"></i>
+                    <p>Your generated visual creations will appear here.</p>
+                </div>
+            `;
+            return;
+        }
+
+        historyItems.forEach(item => {
+            const itemEl = document.createElement("div");
+            itemEl.className = "history-item";
+            
+            const formattedDate = new Date(item.timestamp).toLocaleDateString(undefined, {
+                month: 'short',
+                day: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit'
+            });
+
+            itemEl.innerHTML = `
+                <div class="history-img-box">
+                    <img src="${item.imageData}" alt="Generated AI artwork">
+                </div>
+                <div class="history-info">
+                    <p class="history-prompt" title="${item.prompt}">${item.prompt}</p>
+                    <div class="history-meta">
+                        <span class="history-style">${item.category === "none" ? "Default" : item.category}</span>
+                        <span>${formattedDate}</span>
+                    </div>
+                </div>
+                <div class="history-actions">
+                    <button class="btn-history-action btn-hist-download" data-id="${item.id}">
+                        <i class="ri-download-2-line"></i> Download
+                    </button>
+                    <button class="btn-history-action btn-hist-copy" data-prompt="${item.prompt}">
+                        <i class="ri-file-copy-line"></i> Copy
+                    </button>
+                </div>
+            `;
+            
+            // Bind action buttons
+            itemEl.querySelector(".btn-hist-download").addEventListener("click", () => {
+                downloadBase64Image(item.imageData, item.prompt, item.seed);
+            });
+            itemEl.querySelector(".btn-hist-copy").addEventListener("click", () => {
+                navigator.clipboard.writeText(item.prompt).then(() => {
+                    showToast("Prompt copied to clipboard!", "success");
+                });
+            });
+
+            el.historyGrid.appendChild(itemEl);
+        });
+    });
+}
+
+function downloadBase64Image(base64Data, prompt, seed) {
+    try {
+        const link = document.createElement("a");
+        link.href = base64Data;
+        const cleanPrompt = prompt.trim()
+            .substring(0, 30)
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, "-");
+        link.download = `pixelai-studio-${cleanPrompt}-${seed || 'history'}.jpg`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        showToast("Image downloaded successfully!", "success");
+    } catch (err) {
+        console.error("History download failed:", err);
+        showToast("Failed to download image", "info");
+    }
+}
+
+function handleUpdateProfile(e) {
+    e.preventDefault();
+    if (!auth.currentUser) return;
+    
+    const newName = el.updateName.value.trim();
+    if (!newName) {
+        showToast("Display name cannot be empty.", "info");
+        return;
+    }
+
+    showToast("Saving settings...", "info");
+    updateProfile(auth.currentUser, {
+        displayName: newName
+    }).then(() => {
+        state.currentUser = newName;
+        updateNavForUser(newName);
+        el.profileDisplayName.textContent = newName;
+        showToast("Profile settings updated successfully!", "success");
+    }).catch(err => {
+        console.error("Profile update error:", err);
+        showToast("Failed to update profile settings.", "info");
+    });
+}
+
+function handleClearHistory() {
+    if (!auth.currentUser) return;
+    if (confirm("Are you sure you want to clear your creation history? This action cannot be undone.")) {
+        clearGenerationHistory(auth.currentUser.uid).then(success => {
+            if (success) {
+                renderProfilePage();
+                showToast("Creation history cleared successfully.", "success");
+            } else {
+                showToast("Failed to clear creation history.", "info");
+            }
+        });
     }
 }
 
@@ -601,6 +1269,30 @@ function handleLoginSubmit(e) {
         });
 }
 
+function triggerWelcomeEmail(email, name) {
+    fetch('/api/send-welcome', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            email: email,
+            name: name,
+            origin: window.location.origin
+        })
+    }).then(res => res.json())
+      .then(data => {
+          if (data.success) {
+              console.log('Welcome email dispatched successfully:', data);
+          } else {
+              console.warn('Failed to dispatch welcome email:', data.error);
+          }
+      })
+      .catch(err => {
+          console.error('Welcome email dispatch error:', err);
+      });
+}
+
 function handleSignupSubmit(e) {
     e.preventDefault();
     const name = el.signupName.value.trim();
@@ -617,6 +1309,9 @@ function handleSignupSubmit(e) {
                 closeAuthModal();
                 showToast(`Welcome, ${name}! Account registered.`, "success");
                 switchView("studio");
+                
+                // Trigger welcome email dispatch
+                triggerWelcomeEmail(email, name);
             });
         })
         .catch((error) => {
@@ -633,33 +1328,13 @@ function handleSignupSubmit(e) {
         });
 }
 
-function handleGoogleAuth() {
-    showToast("Connecting to Google...", "info");
-    const provider = new GoogleAuthProvider();
-    signInWithPopup(auth, provider)
-        .then((result) => {
-            const user = result.user;
-            closeAuthModal();
-            showToast(`Welcome, ${user.displayName || user.email}!`, "success");
-            switchView("studio");
-        })
-        .catch((error) => {
-            console.error("Google authentication failed:", error);
-            let message = "Google authentication failed";
-            if (error.code === "auth/popup-closed-by-user") {
-                message = "Sign-in popup closed before completion.";
-            } else if (error.code === "auth/cancelled-popup-request") {
-                message = "Sign-in request cancelled.";
-            }
-            showToast(message, "info");
-        });
-}
+
 
 // ==========================================================================
 // IMAGE GENERATION MODULE
 // ==========================================================================
 
-function generateImage() {
+async function generateImage() {
     if (!state.isLoggedIn) {
         openAuthModal("login");
         showToast("You must sign in to generate images.", "info");
@@ -686,6 +1361,34 @@ function generateImage() {
 
     if (state.isGenerating) return;
     state.isGenerating = true;
+
+    // Deduct credit using Firestore Transaction (Free tier only)
+    if (!isPro) {
+        try {
+            showToast("Checking and deducting credit...", "info");
+            await deductCreditTransaction(auth.currentUser.uid, "image_generation");
+        } catch (err) {
+            console.error("Credit transaction failed:", err);
+            showToast(err.message || "Failed to deduct credit.", "info");
+            state.isGenerating = false;
+            return;
+        }
+    } else {
+        // Log Pro generation for audit trail (0 credits)
+        try {
+            const transactionCollRef = collection(db, "credit_transactions");
+            const newTxDocRef = doc(transactionCollRef);
+            await setDoc(newTxDocRef, {
+                userId: auth.currentUser.uid,
+                action: "image_generation_pro",
+                creditsUsed: 0,
+                timestamp: Date.now()
+            });
+        } catch (err) {
+            console.warn("Failed to write pro audit log:", err);
+        }
+    }
+
     state.prompt = rawPrompt;
     state.seed = Math.floor(Math.random() * 999999999);
 
@@ -760,27 +1463,29 @@ function generateImage() {
             el.imageFrame.classList.remove("loading-active");
             el.actionButtons.classList.remove("hide");
             
-            // Deduct credit if free tier
-            if (!isPro) {
-                state.credits = Math.max(0, state.credits - 1);
-                localStorage.setItem(`pixelai_credits_${auth.currentUser.uid}`, state.credits.toString());
-                updateCreditsUI();
-            }
-            
             showToast("Visual generated successfully!", "success");
+
+            // Save to IndexedDB local history
+            saveGenerationToHistory(auth.currentUser.uid, state.prompt, state.category, state.seed, blob);
 
             // Clean up button state
             state.isGenerating = false;
             el.generateBtn.disabled = false;
             el.generateBtn.querySelector(".btn-text").textContent = "Generate Image";
         })
-        .catch((error) => {
+        .catch(async (error) => {
             clearInterval(logInterval);
             console.error("AI Image generation failure: ", error);
             showCanvasState("error");
             el.imageFrame.classList.remove("loading-active");
             
-            showToast("Failed to generate image. Please try again.", "info");
+            // Refund the credit (Free tier only)
+            if (!isPro) {
+                showToast("Generation failed. Refunding credit...", "info");
+                await refundCreditTransaction(auth.currentUser.uid, "image_generation_refund");
+            } else {
+                showToast("Failed to generate image. Please try again.", "info");
+            }
 
             state.isGenerating = false;
             el.generateBtn.disabled = false;
